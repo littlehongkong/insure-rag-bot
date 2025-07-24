@@ -545,20 +545,20 @@ class DisclosureCollector:
         logging.info(f"🚀 전체 파이프라인 시작: {pipeline_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         try:
-            # # 1. 원천 데이터 수집
-            # logging.info("=" * 50)
-            # logging.info("1단계: 원천 데이터 수집")
-            # logging.info("=" * 50)
-            #
-            # if not self.collect_raw_data():
-            #     logging.error("❌ 원천 데이터 수집 실패")
-            #     return False
+            # 1. 원천 데이터 수집
+            logging.info("=" * 50)
+            logging.info("1단계: 원천 데이터 수집")
+            logging.info("=" * 50)
 
-            # # 2. 데이터 처리
-            # logging.info("=" * 50)
-            # logging.info("2단계: 데이터 처리 및 보정")
-            # logging.info("=" * 50)
-            #
+            if not self.collect_raw_data():
+                logging.error("❌ 원천 데이터 수집 실패")
+                return False
+
+            # 2. 데이터 처리
+            logging.info("=" * 50)
+            logging.info("2단계: 데이터 처리 및 보정")
+            logging.info("=" * 50)
+
             processed_data = self.process_raw_data()
             if not processed_data:
                 logging.error("❌ 데이터 처리 실패")
