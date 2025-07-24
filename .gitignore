@@ -127,3 +127,7 @@ data/
 *.xls
 *.db
 *.sqlite3
+
+
+app/services/processed_data/*.json
+app/services/raw_data/*.json
