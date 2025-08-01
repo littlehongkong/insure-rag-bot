@@ -38,6 +38,19 @@ jobs:
           uv pip install --system -r requirements.txt
           uv pip install --system -e .
 
+      - name: Check required environment variables
+        run: |
+          echo "🔍 Checking required environment variables..."
+          if [ -z "${SUPABASE_URL}" ]; then
+            echo "❌ SUPABASE_URL 환경 변수가 설정되지 않았습니다."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_KEY}" ]; then
+            echo "❌ SUPABASE_KEY 환경 변수가 설정되지 않았습니다."
+            exit 1
+          fi
+          echo "✅ 모든 환경 변수가 정상적으로 설정되었습니다."
+
       - name: Run batch process
         run: |
           echo "🔁 Starting batch process..."
