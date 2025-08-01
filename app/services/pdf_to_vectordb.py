@@ -1,4 +1,5 @@
 import os
+import re
 import PyPDF2
 import requests
 from pathlib import Path
@@ -7,34 +8,46 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.document_loaders import PyPDFLoader
 from langchain.schema import Document
-import chromadb
+import psycopg2
 from sentence_transformers import SentenceTransformer
-import numpy as np
 from typing import List, Dict, Any, Optional
 import supabase
 from datetime import datetime
+import numpy as np
+import json
+import logging
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
-class PDFToVectorDB:
-    def __init__(self, use_openai=False, openai_api_key=None):
+
+class CloudRAGProcessor:
+    def __init__(self, use_openai=False, openai_api_key=None, storage_type="supabase"):
         """
-        PDF를 벡터 DB에 저장하는 클래스
+        클라우드 기반 RAG 시스템
 
         Args:
-            use_openai (bool): OpenAI 임베딩 사용 여부 (False면 무료 모델 사용)
-            openai_api_key (str): OpenAI API 키 (use_openai=True일 때 필요)
+            use_openai (bool): OpenAI 임베딩 사용 여부
+            openai_api_key (str): OpenAI API 키
+            storage_type (str): "supabase", "postgresql", "pinecone" 중 선택
         """
         self.use_openai = use_openai
+        self.storage_type = storage_type
 
+        # 임베딩 모델 설정
         if use_openai and openai_api_key:
             os.environ["OPENAI_API_KEY"] = openai_api_key
             self.embeddings = OpenAIEmbeddings()
+            self.embedding_dim = 1536  # OpenAI ada-002 차원
         else:
-            # 무료 임베딩 모델 사용 (sentence-transformers)
+            # 무료 임베딩 모델 (한국어 지원)
             self.embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
             self.embeddings = None
+            self.embedding_dim = 384  # MiniLM 차원
 
         # 텍스트 분할기 설정
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -43,104 +56,296 @@ class PDFToVectorDB:
             length_function=len,
         )
 
-        # 로컬 ChromaDB 클라이언트 초기화
-        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'chroma_db')
-        os.makedirs(db_path, exist_ok=True)
-        self.chroma_client = chromadb.PersistentClient(path=db_path)
-        
-        # PDF 저장 경로 설정
-        self.pdf_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'pdfs')
-        os.makedirs(self.pdf_dir, exist_ok=True)
-        
-        # Supabase 클라이언트 초기화
-        load_dotenv()
+        # 스토리지 초기화
+        self._init_storage()
+
+    def _init_storage(self):
+        """스토리지 초기화"""
+        if self.storage_type == "supabase":
+            self._init_supabase()
+        elif self.storage_type == "postgresql":
+            self._init_postgresql()
+        elif self.storage_type == "pinecone":
+            self._init_pinecone()
+
+    def _init_supabase(self):
+        """Supabase 초기화 (벡터 확장 사용)"""
         self.supabase_url = os.getenv('SUPABASE_URL')
         self.supabase_key = os.getenv('SUPABASE_KEY')
         self.supabase = supabase.create_client(self.supabase_url, self.supabase_key)
 
-    def download_pdf(self, summary_seq: str, product_info: Dict[str, Any]) -> Optional[str]:
-        """PDF를 다운로드하고 저장된 경로를 반환합니다."""
+        # 벡터 테이블 생성 (최초 1회만)
+        self._create_vector_table()
+
+    def _init_postgresql(self):
+        """PostgreSQL + pgvector 초기화 (Render 등)"""
+        self.db_url = os.getenv('DATABASE_URL')  # Render에서 제공
+        self.conn = psycopg2.connect(self.db_url)
+        self._create_pgvector_table()
+
+    def _init_pinecone(self):
+        """Pinecone 초기화"""
         try:
-            url = f"https://kpub.knia.or.kr/file/download/{summary_seq}.do"
-            response = requests.get(url, stream=True, verify=False)
-            response.raise_for_status()
-            
-            # 파일명 생성 (TP_CODE_PCODE_타임스탬프.pdf)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{product_info.get('TP_CODE', '')}_{product_info.get('P_CODE', '')}_{timestamp}.pdf"
-            filepath = os.path.join(self.pdf_dir, filename)
-            
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    
-            return filepath
-            
+            import pinecone
+            pinecone.init(
+                api_key=os.getenv('PINECONE_API_KEY'),
+                environment=os.getenv('PINECONE_ENV', 'us-west1-gcp-free')
+            )
+
+            index_name = "insurance-rag"
+            if index_name not in pinecone.list_indexes():
+                pinecone.create_index(
+                    index_name,
+                    dimension=self.embedding_dim,
+                    metric="cosine"
+                )
+            self.pinecone_index = pinecone.Index(index_name)
+        except ImportError:
+            logger.error("pinecone-client 패키지가 필요합니다: pip install pinecone-client")
+
+    def _create_vector_table(self):
+        """Supabase에 벡터 테이블 생성"""
+        try:
+            # 벡터 확장 활성화 (Supabase 콘솔에서 미리 활성화 필요)
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS document_vectors (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                metadata JSONB,
+                embedding VECTOR({self.embedding_dim}),
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS document_vectors_embedding_idx 
+            ON document_vectors USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+            """
+
+            # RPC 함수로 실행 (Supabase에서 SQL 실행)
+            logger.info("벡터 테이블 생성 완료 (수동으로 Supabase 콘솔에서 실행 필요)")
+
         except Exception as e:
-            print(f"PDF 다운로드 실패 (SUMMARY_SEQ: {summary_seq}): {str(e)}")
-            return None
-            
-    def fetch_insurance_products(self) -> List[Dict[str, Any]]:
-        """insurance_products_raw 테이블에서 데이터를 조회합니다."""
+            logger.warning(f"벡터 테이블 생성 실패: {e}")
+
+    def _create_pgvector_table(self):
+        """PostgreSQL에 벡터 테이블 생성"""
         try:
-            response = self.supabase.table('insurance_products_raw').select('*').execute()
-            return response.data if hasattr(response, 'data') else []
+            with self.conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS document_vectors (
+                        id SERIAL PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        metadata JSONB,
+                        embedding VECTOR({self.embedding_dim}),
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS document_vectors_embedding_idx 
+                    ON document_vectors USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100);
+                """)
+                self.conn.commit()
+                logger.info("PostgreSQL 벡터 테이블 생성 완료")
         except Exception as e:
-            print(f"데이터베이스 조회 실패: {str(e)}")
-            return []
-            
-    def process_insurance_products(self, collection_name: str = "insurance_docs") -> None:
-        """보험 상품 데이터를 처리하여 PDF를 다운로드하고 벡터 DB에 저장합니다."""
-        products = self.fetch_insurance_products()
-        if not products:
-            print("처리할 보험 상품이 없습니다.")
-            return
-            
-        for product in products:
-            summary_seq = product.get('SUMMARY_SEQ')
-            if not summary_seq:
-                print(f"SUMMARY_SEQ가 없는 상품 건너뜁니다: {product.get('ID')}")
-                continue
-                
-            print(f"처리 중: {product.get('TP_NAME')} - {product.get('P_CODE_NM')}")
-            
-            # PDF 다운로드
-            pdf_path = self.download_pdf(summary_seq, product)
-            if not pdf_path:
-                print(f"PDF 다운로드 실패: {summary_seq}")
-                continue
-                
-            # PDF에서 텍스트 추출 (메타데이터와 함께)
-            try:
-                documents = self.extract_text_from_pdf(pdf_path, product_info=product)
-                if not documents:
-                    print(f"텍스트 추출 실패: {pdf_path}")
-                    continue
-                
-                # 벡터 DB에 저장
-                self.save_to_chroma_manual(documents, collection_name)
-                print(f"처리 완료: {pdf_path}")
-                
-            except Exception as e:
-                print(f"처리 중 오류 발생 ({pdf_path}): {str(e)}")
-    
-    def extract_text_from_pdf(self, pdf_path, product_info=None):
-        """PDF에서 텍스트 추출
-        
-        Args:
-            pdf_path (str): PDF 파일 경로
-            product_info (dict, optional): 상품 정보가 포함된 딕셔너리. 기본값은 None입니다.
-                - ID: 상품 ID
-                - TP_NAME: 상품명
-                - TP_CODE: 상품 코드
-                - P_CODE_NM: 상품 코드명
-        """
+            logger.error(f"PostgreSQL 테이블 생성 실패: {e}")
+
+    def create_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """텍스트를 임베딩으로 변환"""
+        if self.use_openai:
+            return [self.embeddings.embed_query(text) for text in texts]
+        else:
+            embeddings = self.embedding_model.encode(texts)
+            return embeddings.tolist()
+
+
+
+    def clean_text(self, text: str) -> str:
+        # NULL 문자 및 기타 제어문자 제거
+        return re.sub(r'[\x00-\x1F\x7F]', '', text)
+
+
+    def save_documents_to_cloud(self, documents: List[Document]) -> bool:
+        """문서를 클라우드 벡터 DB에 저장"""
+        if not documents:
+            logger.warning("저장할 문서가 없습니다.")
+            return False
+
+        # 텍스트 분할
+        texts = self.text_splitter.split_documents(documents)
+        logger.info(f"총 {len(texts)}개의 청크로 분할되었습니다.")
+
+        # 텍스트와 메타데이터 준비
+        text_contents = [doc.page_content for doc in texts]
+
+        metadatas = [doc.metadata for doc in texts]
+
+        # 임베딩 생성
+        logger.info("임베딩 생성 중...")
+        embeddings = self.create_embeddings(text_contents)
+
+
+        # 스토리지별 저장
+        if self.storage_type == "supabase":
+            return self._save_to_supabase(text_contents, embeddings, metadatas)
+        elif self.storage_type == "postgresql":
+            return self._save_to_postgresql(text_contents, embeddings, metadatas)
+        elif self.storage_type == "pinecone":
+            return self._save_to_pinecone(text_contents, embeddings, metadatas)
+
+    def _save_to_supabase(self, texts: List[str], embeddings: List[List[float]], metadatas: List[Dict]) -> bool:
+        """Supabase에 저장"""
         try:
-            # PyPDFLoader 사용 (권장)
+            batch_size = 50
+            for i in range(0, len(texts), batch_size):
+                batch_data = []
+                for j in range(i, min(i + batch_size, len(texts))):
+                    batch_data.append({
+                        "content": self.clean_text(texts[j]),
+                        "metadata": metadatas[j],
+                        "embedding": embeddings[j]
+                    })
+
+                result = self.supabase.table('document_vectors').insert(batch_data).execute()
+                logger.info(f"{min(i + batch_size, len(texts))}/{len(texts)} 문서 처리 완료")
+
+            logger.info(f"총 {len(texts)}개 문서가 Supabase에 저장되었습니다.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Supabase 저장 오류: {e}")
+            return False
+
+    def _save_to_postgresql(self, texts: List[str], embeddings: List[List[float]], metadatas: List[Dict]) -> bool:
+        """PostgreSQL에 저장"""
+        try:
+            with self.conn.cursor() as cur:
+                batch_size = 50
+                for i in range(0, len(texts), batch_size):
+                    batch_data = []
+                    for j in range(i, min(i + batch_size, len(texts))):
+                        batch_data.append((
+                            texts[j],
+                            json.dumps(metadatas[j]),
+                            embeddings[j]
+                        ))
+
+                    cur.executemany("""
+                        INSERT INTO document_vectors (content, metadata, embedding)
+                        VALUES (%s, %s, %s)
+                    """, batch_data)
+
+                    self.conn.commit()
+                    logger.info(f"{min(i + batch_size, len(texts))}/{len(texts)} 문서 처리 완료")
+
+            logger.info(f"총 {len(texts)}개 문서가 PostgreSQL에 저장되었습니다.")
+            return True
+
+        except Exception as e:
+            logger.error(f"PostgreSQL 저장 오류: {e}")
+            return False
+
+    def _save_to_pinecone(self, texts: List[str], embeddings: List[List[float]], metadatas: List[Dict]) -> bool:
+        """Pinecone에 저장"""
+        try:
+            vectors = []
+            for i, (text, embedding, metadata) in enumerate(zip(texts, embeddings, metadatas)):
+                vectors.append({
+                    "id": f"doc_{i}_{datetime.now().timestamp()}",
+                    "values": embedding,
+                    "metadata": {**metadata, "content": text}
+                })
+
+            # 배치 업로드
+            batch_size = 100
+            for i in range(0, len(vectors), batch_size):
+                batch = vectors[i:i + batch_size]
+                self.pinecone_index.upsert(vectors=batch)
+                logger.info(f"{min(i + batch_size, len(vectors))}/{len(vectors)} 벡터 업로드 완료")
+
+            logger.info(f"총 {len(vectors)}개 벡터가 Pinecone에 저장되었습니다.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Pinecone 저장 오류: {e}")
+            return False
+
+    def search_similar(self, query: str, k: int = 5) -> Dict[str, Any]:
+        """유사 문서 검색"""
+        query_embedding = self.create_embeddings([query])[0]
+
+        if self.storage_type == "supabase":
+            return self._search_supabase(query_embedding, k)
+        elif self.storage_type == "postgresql":
+            return self._search_postgresql(query_embedding, k)
+        elif self.storage_type == "pinecone":
+            return self._search_pinecone(query_embedding, k)
+
+    def _search_supabase(self, query_embedding: List[float], k: int) -> Dict[str, Any]:
+        """Supabase에서 검색"""
+        try:
+            # RPC 함수 사용 (Supabase 콘솔에서 미리 생성 필요)
+            result = self.supabase.rpc('match_documents', {
+                'query_embedding': query_embedding,
+                'match_threshold': 0.7,
+                'match_count': k
+            }).execute()
+
+            return {
+                'documents': [item['content'] for item in result.data],
+                'metadatas': [item['metadata'] for item in result.data],
+                'scores': [item['similarity'] for item in result.data]
+            }
+        except Exception as e:
+            logger.error(f"Supabase 검색 오류: {e}")
+            return {}
+
+    def _search_postgresql(self, query_embedding: List[float], k: int) -> Dict[str, Any]:
+        """PostgreSQL에서 검색"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT content, metadata, 1 - (embedding <=> %s) as similarity
+                    FROM document_vectors
+                    ORDER BY embedding <=> %s
+                    LIMIT %s
+                """, (query_embedding, query_embedding, k))
+
+                results = cur.fetchall()
+                return {
+                    'documents': [row[0] for row in results],
+                    'metadatas': [row[1] for row in results],
+                    'scores': [row[2] for row in results]
+                }
+        except Exception as e:
+            logger.error(f"PostgreSQL 검색 오류: {e}")
+            return {}
+
+    def _search_pinecone(self, query_embedding: List[float], k: int) -> Dict[str, Any]:
+        """Pinecone에서 검색"""
+        try:
+            results = self.pinecone_index.query(
+                vector=query_embedding,
+                top_k=k,
+                include_metadata=True
+            )
+
+            return {
+                'documents': [match['metadata']['content'] for match in results['matches']],
+                'metadatas': [match['metadata'] for match in results['matches']],
+                'scores': [match['score'] for match in results['matches']]
+            }
+        except Exception as e:
+            logger.error(f"Pinecone 검색 오류: {e}")
+            return {}
+
+    def extract_text_from_pdf(self, pdf_path: str, product_info: Dict = None) -> List[Document]:
+        """PDF에서 텍스트 추출"""
+        try:
             loader = PyPDFLoader(pdf_path)
             pages = loader.load()
-            
-            # 메타데이터 추가
+
             if product_info:
                 for page in pages:
                     page.metadata.update({
@@ -152,235 +357,149 @@ class PDFToVectorDB:
                         'page': page.metadata.get('page', 0)
                     })
             return pages
-            
+
         except Exception as e:
-            print(f"PyPDFLoader 오류, PyPDF2로 대체: {e}")
-            # PyPDF2 사용 (백업)
-            documents = []
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page_num, page in enumerate(pdf_reader.pages):
-                    text = page.extract_text()
-                    metadata = {
-                        "source": pdf_path, 
-                        "page": page_num
-                    }
-                    
-                    # 상품 정보가 있으면 메타데이터에 추가
-                    if product_info:
-                        metadata.update({
-                            'id': str(product_info.get('ID')),
-                            'tp_name': product_info.get('TP_NAME', ''),
-                            'tp_code': product_info.get('TP_CODE', ''),
-                            'p_code_nm': product_info.get('P_CODE_NM', '')
-                        })
-                        
-                    doc = Document(
-                        page_content=text,
-                        metadata=metadata
-                    )
-                    documents.append(doc)
-            return documents
+            logger.error(f"PDF 추출 오류: {e}")
+            return []
 
-    def create_embeddings(self, texts):
-        """텍스트를 임베딩으로 변환"""
-        if self.use_openai:
-            # OpenAI 임베딩 사용
-            return [self.embeddings.embed_query(text) for text in texts]
-        else:
-            # 무료 모델 사용
-            embeddings = self.embedding_model.encode(texts)
-            return embeddings.tolist()
-
-    def save_to_chroma_manual(self, documents, collection_name="pdf_collection"):
-        """로컬 ChromaDB에 문서 저장 (무료 임베딩 모델 사용시)"""
-        if not documents:
-            print("저장할 문서가 없습니다.")
+    def process_insurance_products(self) -> None:
+        """보험 상품 PDF 처리 및 클라우드 저장"""
+        # Supabase에서 보험 상품 정보 조회
+        try:
+            supabase_client = supabase.create_client(
+                os.getenv('SUPABASE_URL'),
+                os.getenv('SUPABASE_KEY')
+            )
+            # 개발용으로 10개만 처리 (디버깅 용이)
+            # response = supabase_client.table('insurance_products_raw').select('*').limit(10).execute()
+            response = supabase_client.table('insurance_products_raw').select('*').execute()
+            products = response.data if hasattr(response, 'data') else []
+            logger.info(f"총 {len(products)}개 보험 상품을 처리합니다.")
+        except Exception as e:
+            logger.error(f"데이터베이스 조회 실패: {e}")
             return
 
-        # 텍스트 분할
-        texts = self.text_splitter.split_documents(documents)
-        print(f"총 {len(texts)}개의 청크로 분할되었습니다.")
+        successful_count = 0
+        failed_count = 0
 
-        # 텍스트와 메타데이터 준비
-        text_contents = [doc.page_content for doc in texts]
-        metadatas = [doc.metadata for doc in texts]
-        ids = [f"doc_{i}" for i in range(len(texts))]
-
-        # 임베딩 생성
-        print("임베딩 생성 중...")
-        embeddings = self.create_embeddings(text_contents)
-
-        # 로컬 ChromaDB에 저장
-        try:
-            # 컬렉션 생성 또는 가져오기
-            try:
-                collection = self.chroma_client.get_collection(collection_name)
-                print(f"기존 컬렉션 '{collection_name}'에 저장 중...")
-            except:
-                collection = self.chroma_client.create_collection(name=collection_name)
-                print(f"새 컬렉션 '{collection_name}'을 생성하고 저장 중...")
-
-            # 배치 단위로 저장 (메모리 사용량 제한을 위해)
-            batch_size = 50
-            for i in range(0, len(text_contents), batch_size):
-                batch_texts = text_contents[i:i + batch_size]
-                batch_embeddings = embeddings[i:i + batch_size]
-                batch_metadatas = metadatas[i:i + batch_size]
-                batch_ids = ids[i:i + batch_size]
-
-                # 배치별로 문서 추가
-                collection.upsert(
-                    documents=batch_texts,
-                    embeddings=batch_embeddings,
-                    metadatas=batch_metadatas,
-                    ids=batch_ids
-                )
-                print(f"{min(i + batch_size, len(text_contents))}/{len(text_contents)} 문서 처리 완료")
-
-            print(f"\n총 {len(text_contents)}개의 문서가 로컬 ChromaDB에 성공적으로 저장되었습니다.")
-            print(f"저장 경로: {os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'chroma_db')}")
-            return True
-
-        except Exception as e:
-            print(f"문서 저장 중 오류 발생: {str(e)}")
-            return False
-
-    def search_similar(self, query, collection_name="pdf_collection", k=5):
-        """유사한 문서 검색"""
-        try:
-            collection = self.chroma_client.get_collection(collection_name)
-
-            # 쿼리 임베딩 생성
-            query_embedding = self.create_embeddings([query])[0]
-
-            # 검색 수행
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=k
-            )
-
-            return results
-        except Exception as e:
-            print(f"검색 오류: {e}")
-            return None
-
-    def process_pdf(self, pdf_path, collection_name="pdf_collection"):
-        """PDF 파일을 처리하여 벡터 DB에 저장"""
-        print(f"PDF 처리 시작: {pdf_path}")
-
-        # PDF에서 텍스트 추출
-        documents = self.extract_text_from_pdf(pdf_path)
-        print(f"추출된 페이지 수: {len(documents)}")
-
-        # 벡터 DB에 저장
-        if self.use_openai:
-            collection = self.save_to_chroma_manual(documents, collection_name)
-        else:
-            collection = self.save_to_chroma_manual(documents, collection_name)
-
-        print("PDF 처리 완료!")
-        return collection
-
-
-def process_pdf_directory(pdf_dir: str, processor, collection_name: str = "insurance_pdfs") -> None:
-    """지정된 디렉토리의 모든 PDF 파일을 처리하여 벡터 DB에 저장"""
-    pdf_dir = Path(pdf_dir)
-    if not pdf_dir.exists() or not pdf_dir.is_dir():
-        print(f"오류: '{pdf_dir}' 디렉토리를 찾을 수 없습니다.")
-        return
-
-    pdf_files = list(pdf_dir.glob("*.pdf"))
-    if not pdf_files:
-        print(f"'{pdf_dir}' 디렉토리에 PDF 파일이 없습니다.")
-        return
-
-    print(f"\n{'='*50}")
-    print(f"총 {len(pdf_files)}개의 PDF 파일을 처리합니다.")
-    print(f"{'='*50}\n")
-
-    for pdf_file in pdf_files:
-        try:
-            print(f"\n[처리 중] {pdf_file.name}")
-            print("-" * 50)
-
-            # PDF에서 텍스트 추출
-            documents = processor.extract_text_from_pdf(str(pdf_file))
-            if not documents:
-                print(f"경고: '{pdf_file}'에서 텍스트를 추출할 수 없습니다. 건너뜁니다.")
+        for i, product in enumerate(products, 1):
+            summary_seq = product.get('SUMMARY_SEQ')
+            if not summary_seq:
+                logger.warning(f"SUMMARY_SEQ가 없는 상품 건너뜀: {product.get('ID')}")
+                failed_count += 1
                 continue
 
-            # Chroma에 저장
-            success = processor.save_to_chroma_manual(
-                documents,
-                collection_name=collection_name
-            )
+            tp_name = product.get('TP_NAME', '알수없음')
+            p_code_nm = product.get('P_CODE_NM', '알수없음')
+            logger.info(f"[{i}/{len(products)}] 처리 중: {tp_name} - {p_code_nm}")
 
-            if success:
-                print(f"[완료] {pdf_file.name} 처리 완료")
+            # PDF 다운로드 (임시 파일로)
+            pdf_path = self._download_pdf_temp(summary_seq, product)
+            if not pdf_path:
+                logger.error(f"PDF 다운로드 실패로 건너뜀: {summary_seq}")
+                failed_count += 1
+                continue
+
+            # PDF 처리 및 클라우드 저장
+            try:
+                documents = self.extract_text_from_pdf(pdf_path, product_info=product)
+                if documents:
+                    success = self.save_documents_to_cloud(documents)
+                    if success:
+                        logger.info(f"✅ 처리 완료: {tp_name}")
+                        successful_count += 1
+                    else:
+                        logger.error(f"❌ 벡터 저장 실패: {tp_name}")
+                        failed_count += 1
+                else:
+                    logger.error(f"❌ 텍스트 추출 실패: {tp_name}")
+                    failed_count += 1
+
+                # 임시 파일 삭제 (안전하게)
+                try:
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                        logger.info(f"임시 파일 삭제: {pdf_path}")
+                except Exception as delete_error:
+                    logger.warning(f"임시 파일 삭제 실패: {delete_error}")
+
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"❌ 처리 중 오류 ({tp_name}): {e}")
+
+                raise
+
+        # 최종 결과 출력
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"처리 완료! 성공: {successful_count}개, 실패: {failed_count}개")
+        logger.info(f"{'=' * 50}")
+
+    def _download_pdf_temp(self, summary_seq: str, product_info: Dict) -> Optional[str]:
+        """PDF를 임시 파일로 다운로드"""
+        try:
+            url = f"https://kpub.knia.or.kr/file/download/{summary_seq}.do"
+
+            # SSL 경고 무시 설정
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+            response = requests.get(url, stream=True, verify=False, timeout=30)
+            response.raise_for_status()
+
+            # Windows 호환 임시 디렉토리 생성
+            import tempfile
+            temp_dir = tempfile.gettempdir()  # Windows: C:\Users\USER\AppData\Local\Temp
+
+            # 안전한 파일명 생성 (특수문자 제거)
+            safe_tp_code = "".join(c for c in str(product_info.get('TP_CODE', 'unknown')) if c.isalnum())
+            temp_filename = os.path.join(temp_dir, f"{safe_tp_code}_{summary_seq}.pdf")
+
+            # 파일 저장
+            with open(temp_filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # 빈 청크 필터링
+                        f.write(chunk)
+
+            # 파일이 실제로 생성되었는지 확인
+            if os.path.exists(temp_filename) and os.path.getsize(temp_filename) > 0:
+                logger.info(f"PDF 다운로드 성공: {temp_filename} ({os.path.getsize(temp_filename)} bytes)")
+                return temp_filename
             else:
-                print(f"[실패] {pdf_file.name} 처리 중 오류 발생")
+                logger.error(f"PDF 파일이 비어있거나 생성되지 않음: {temp_filename}")
+                return None
 
+        except requests.exceptions.Timeout:
+            logger.error(f"PDF 다운로드 타임아웃 (SUMMARY_SEQ: {summary_seq})")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"PDF 다운로드 네트워크 오류 (SUMMARY_SEQ: {summary_seq}): {e}")
+            return None
         except Exception as e:
-            print(f"오류: {pdf_file} 처리 중 예외 발생 - {str(e)}")
-            continue
+            logger.error(f"PDF 다운로드 실패 (SUMMARY_SEQ: {summary_seq}): {e}")
+            return None
+
 
 
 def main():
-    # 환경 변수에서 OpenAI API 키 로드
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    use_openai = False  # 기본값은 무료 모델 사용
-    
-    # PDFToVectorDB 인스턴스 생성
-    print("PDF 처리기 초기화 중...")
-    pdf_processor = PDFToVectorDB(use_openai=use_openai, openai_api_key=openai_api_key)
-    
-    try:
-        # 1. 데이터베이스에서 보험 상품 정보를 가져와 PDF 다운로드 및 처리
-        print("\n보험 상품 데이터베이스에서 PDF 다운로드 및 처리 중...")
-        pdf_processor.process_insurance_products(collection_name="insurance_docs")
-        print("보험 상품 PDF 처리 완료!")
-    except Exception as e:
-        print(f"보험 상품 처리 중 오류 발생: {str(e)}")
-        print("PDF 디렉토리에서 파일 처리를 시도합니다...")
-    
-    # 2. PDF 디렉토리에서 직접 파일 처리 (백업)
-    try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        pdf_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "pdfs")
-        
-        # PDF 디렉토리가 존재하는지 확인
-        if os.path.exists(pdf_dir) and os.path.isdir(pdf_dir):
-            print(f"\nPDF 디렉토리에서 파일 처리 중: {pdf_dir}")
-            process_pdf_directory(pdf_dir, pdf_processor, collection_name="insurance_pdfs")
-        else:
-            print(f"\nPDF 디렉토리를 찾을 수 없습니다: {pdf_dir}")
-    except Exception as e:
-        print(f"PDF 디렉토리 처리 중 오류 발생: {str(e)}")
-    
-    # 검색 예제 실행
-    print("\n검색 예제:")
-    search_example(pdf_processor, "보험 상품에 대한 정보", collection_name="insurance_pdfs")
+    """메인 실행 함수"""
+    # 환경 변수 확인
+    required_vars = ['SUPABASE_URL', 'SUPABASE_KEY']
+    for var in required_vars:
+        if not os.getenv(var):
+            logger.error(f"환경 변수 {var}가 설정되지 않았습니다.")
+            return
 
-    print("\n모든 처리가 완료되었습니다.")
+    # RAG 프로세서 초기화
+    logger.info("RAG 시스템 초기화 중...")
+    rag_processor = CloudRAGProcessor(
+        use_openai=False,  # 무료 모델 사용
+        storage_type="supabase"  # "supabase", "postgresql", "pinecone" 중 선택
+    )
 
+    # 보험 상품 처리 (개발용으로 제한된 수량)
+    logger.info("보험 상품 PDF 처리 중...")
+    rag_processor.process_insurance_products()
 
-def search_example(processor, query: str = "보험 상품에 대한 정보", collection_name: str = "insurance_pdfs", k: int = 3):
-    """검색 예제 함수"""
-    print(f"\n'{query}'에 대한 유사 문서 검색 중...")
-    results = processor.search_similar(query, collection_name=collection_name, k=k)
-    
-    if results and 'documents' in results and results['documents'] and results['metadatas']:
-        print(f"\n=== 검색 결과 (상위 {k}개) ===")
-        for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0]), 1):
-            source = metadata.get('source', '알 수 없음')
-            print(f"\n{i}. 출처: {os.path.basename(source)}")
-            print(f"   관련 상품: {metadata.get('tp_name', '알 수 없음')} ({metadata.get('tp_code', '')})")
-            print(f"   페이지: {metadata.get('page', 0) + 1} 페이지")
-            print("-" * 80)
-            print(doc[:500] + ("..." if len(doc) > 500 else ""))
-    else:
-        print("검색 결과가 없거나 오류가 발생했습니다.")
 
 
 if __name__ == "__main__":
