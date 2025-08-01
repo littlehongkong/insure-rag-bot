@@ -12,6 +12,8 @@ env:
   PYTHONUNBUFFERED: 1
   PYTHONPATH: ${{ github.workspace }}
   UV_CACHE_DIR: ${{ github.workspace }}/.uv-cache
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
 jobs:
   run-batch:
