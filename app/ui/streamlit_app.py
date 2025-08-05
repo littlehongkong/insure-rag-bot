@@ -1,12 +1,19 @@
 import streamlit as st
-from app.services.chatbot_service import FreeInsuranceChatbot
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
+from app.services.chatbot_service import SupabaseChatbot
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 st.set_page_config(page_title="보험 챗봇", page_icon="🤖")
 
-# Initialize chatbot with vector DB
-chatbot = FreeInsuranceChatbot()
+# Initialize chatbot with Supabase
+try:
+    chatbot = SupabaseChatbot()
+except ValueError as e:
+    st.error("Supabase 연결에 실패했습니다. 환경 변수를 확인해주세요.")
+    st.stop()
 
 # Main page
 st.title("보험 챗봇")
@@ -29,9 +36,9 @@ if prompt := st.chat_input("질문을 입력하세요"):
         st.markdown(prompt)
     
     with st.chat_message("assistant"):
-        with st.spinner("답변 생성 중..."):
+        with st.spinner("보험 상품 검색 중..."):
             response = chatbot.query(prompt)
-            st.markdown(response)
+            st.markdown(response, unsafe_allow_html=True)
     
     # Add assistant message to chat history
     st.session_state.messages.append({"role": "assistant", "content": response})

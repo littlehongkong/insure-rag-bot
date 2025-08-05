@@ -1,10 +1,15 @@
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from langchain.vectorstores import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.llms import Ollama
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import os
+import supabase
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 
 class FreeInsuranceChatbot:
@@ -78,6 +83,89 @@ class FreeInsuranceChatbot:
             return result
         except Exception as e:
             return f"질문 처리 중 오류가 발생했습니다: {str(e)}"
+
+
+class SupabaseChatbot:
+    def __init__(self):
+        """Initialize the chatbot with Supabase connection."""
+        # Initialize Supabase client
+        self.supabase_url = os.getenv('SUPABASE_URL')
+        self.supabase_key = os.getenv('SUPABASE_KEY')
+        if not self.supabase_url or not self.supabase_key:
+            raise ValueError("Supabase URL and Key must be set in environment variables")
+            
+        self.supabase = supabase.create_client(self.supabase_url, self.supabase_key)
+        
+        # Initialize LLM for generating responses
+        self.llm = Ollama(model="llama2", temperature=0)
+
+    def search_insurance_products(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Search for insurance products in insurance_products_raw table."""
+        try:
+            # Search in insurance_products_raw table directly
+            response = self.supabase.table('insurance_products_raw')\
+                .select('*')\
+                .or_(f"TP_NAME.ilike.%{query}%, TP_ETC.ilike.%{query}%")\
+                .limit(limit)\
+                .execute()
+            
+            if hasattr(response, 'data'):
+                return response.data
+            return []
+            
+        except Exception as e:
+            print(f"Error searching products: {str(e)}")
+            return []
+            
+        except Exception as e:
+            print(f"Error searching products: {str(e)}")
+            return []
+
+    def format_product_info(self, product: Dict[str, Any]) -> str:
+        """Format product information into a readable string."""
+        return f"""
+        [보험 상품 정보]
+        상품명: {product.get('TP_NAME', 'N/A')}
+        보험사: {product.get('P_CODE_NM', 'N/A')}
+        상품코드: {product.get('TP_CODE', 'N/A')}
+        상품유형: {product.get('popup_category_sub', 'N/A')}
+        
+        [기본 정보]
+        최소 보험료: {product.get('MIN_BILL', 'N/A')}원
+        월 보험료: {product.get('TP_M_BILL', 'N/A')}원
+        주 보험료: {product.get('TP_W_BILL', 'N/A')}원
+        
+        [기타 정보]
+        치매보장금액: {product.get('DEMENTIA_AMT', 'N/A')}
+        치매보장여부: {product.get('DEMENTIA_YN', 'N/A')}
+        갱신여부: {product.get('RENEW_INS_SEQ', 'N/A')}
+        
+        [상세 정보]
+        {product.get('TP_ETC', '추가 정보가 없습니다.')}
+        """
+
+    def query(self, question: str) -> str:
+        """Generate a response to the user's question using Supabase data."""
+        try:
+            # Search for relevant products
+            products = self.search_insurance_products(question)
+            
+            if not products:
+                return "관련된 보험 상품을 찾을 수 없습니다. 다른 검색어로 시도해 주세요."
+            
+            # Format the response
+            response = f"""
+            검색하신 '{question}' 관련 보험 상품을 찾았습니다. 다음은 검색 결과입니다:
+            ====================================
+            """
+            
+            for i, product in enumerate(products[:3], 1):  # Show top 3 results
+                response += f"\n{i}. {self.format_product_info(product)}"
+            
+            return response
+            
+        except Exception as e:
+            return f"오류가 발생했습니다: {str(e)}"
 
 
 # HuggingFace Transformers 로컬 실행 버전 (추천)
