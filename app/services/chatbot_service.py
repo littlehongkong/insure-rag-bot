@@ -1,66 +1,70 @@
+# app/services/chatbot_service.py
+
 import os
-from typing import List, Dict, Any
-from supabase import create_client, Client
-from langchain.vectorstores import SupabaseVectorStore
-from langchain.embeddings import HuggingFaceEmbeddings
+from supabase import create_client
 from langchain.llms import Ollama
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from typing import List
 
-class SupabaseRAGChatbot:
+class SupabaseChatbot:
     def __init__(self):
-        self.supabase_url = os.getenv('SUPABASE_URL')
-        self.supabase_key = os.getenv('SUPABASE_KEY')
-        if not self.supabase_url or not self.supabase_key:
-            raise ValueError("환경 변수에 SUPABASE_URL 및 SUPABASE_KEY 설정 필요")
+        # Supabase 설정
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if not url or not key:
+            raise ValueError("Supabase URL과 Key가 필요합니다.")
+        self.client = create_client(url, key)
 
-        self.client: Client = create_client(self.supabase_url, self.supabase_key)
-        # 임베딩 모델 (한국어 지원)
-        self.embedding = HuggingFaceEmbeddings(
-            model_name="jhgan/ko-sroberta-multitask",
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
+        # ✅ 768차원 임베딩 모델 (all-mpnet-base-v2)
+        self.model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
-        # Supabase의 document_vectors 테이블을 LangChain VectorStore로 연결
-        self.vectorstore = SupabaseVectorStore(
-            client=self.client,
-            table_name="document_vectors",
-            embedding=self.embedding
-        )
-        self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
+        # Ollama LLM (llama2 등)
+        self.llm = Ollama(model="llama2", temperature=0.2)
 
-        # LLM (Ollama)
-        self.llm = Ollama(model="llama2", temperature=0)
+    def get_query_embedding(self, query: str) -> List[float]:
+        embedding = self.model.encode(query, normalize_embeddings=True)
+        return embedding.tolist()
 
-        # 프롬프트 템플릿
-        prompt_template = """
-        당신은 보험 약관 전문가입니다.
+    def query_supabase(self, query: str, k: int = 3):
+        query_vector = self.get_query_embedding(query)
 
-        다음 문서를 참고하여 질문에 답변해주세요:
+        # ✅ Supabase 벡터 유사도 검색 (pgvector + cosine distance)
+        response = self.client.rpc("match_documents", {
+            "query_embedding": query_vector,
+            "match_count": k
+        })
 
-        {context}
+        if hasattr(response, "data"):
+            return response.data
+        return []
 
-        질문: {question}
+    def build_prompt(self, context: List[str], question: str) -> str:
+        context_text = "\n\n".join([doc["content"][:500] for doc in context])
+        prompt = f"""당신은 보험 약관을 설명하는 전문가입니다.
 
-        답변:
-        """
-        self.prompt = PromptTemplate(
-            input_variables=["context", "question"],
-            template=prompt_template
-        )
+아래 내용을 참고하여 사용자의 질문에 정확하게 답해주세요.
 
-        # RetrievalQA 체인 구성
-        self.qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            retriever=self.retriever,
-            chain_type="stuff",
-            chain_type_kwargs={"prompt": self.prompt}
-        )
+[약관 내용 발췌]
+{context_text}
 
-    def query(self, question: str) -> str:
+[질문]
+{question}
+
+[답변]
+"""
+        return prompt
+
+    def query(self, user_question: str) -> str:
         try:
-            answer = self.qa_chain.run(question)
+            documents = self.query_supabase(user_question)
+
+            if not documents:
+                return "해당 질문에 대한 관련 정보를 찾을 수 없습니다."
+
+            prompt = self.build_prompt(documents, user_question)
+            answer = self.llm(prompt)
             return answer.strip()
+
         except Exception as e:
-            return f"오류 발생: {e}"
+            return f"오류 발생: {str(e)}"
