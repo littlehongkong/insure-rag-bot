@@ -1,10 +1,24 @@
 import streamlit as st
-from langchain.vectorstores import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.llms import Ollama
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import os
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import psycopg2
+from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+import supabase
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Supabase client
+supabase_url = os.getenv('SUPABASE_URL')
+supabase_key = os.getenv('SUPABASE_KEY')
+supabase_client = supabase.create_client(supabase_url, supabase_key)
 
 # Page configuration
 st.set_page_config(
@@ -17,22 +31,66 @@ st.set_page_config(
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Initialize embedding model
+embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+def get_embedding(text: str) -> list[float]:
+    """Generate embedding for the given text"""
+    return embedding_model.encode(text).tolist()
+
+from langchain.schema import BaseRetriever, Document
+
+class SupabaseRetriever(BaseRetriever):
+    def __init__(self, supabase_client, embedding_model, k: int = 3):
+        super().__init__()
+        self._supabase = supabase_client
+        self._embedding_model = embedding_model
+        self._k = k
+    
+    def get_relevant_documents(self, query: str) -> list[Document]:
+        """Retrieve relevant documents from Supabase using vector similarity"""
+        try:
+            # Generate query embedding
+            query_embedding = get_embedding(query)
+            
+            # Query Supabase
+            response = self._supabase.rpc(
+                'match_documents',
+                {
+                    'query_embedding': query_embedding,
+                    'match_count': self._k
+                }
+            ).execute()
+            
+            if not hasattr(response, 'data') or not response.data:
+                return []
+            
+            # Convert to LangChain Document format
+            documents = []
+            for doc in response.data:
+                documents.append(
+                    Document(
+                        page_content=doc.get('content', ''),
+                        metadata={
+                            'source': doc.get('source', ''),
+                            'page': doc.get('page', 0)
+                        }
+                    )
+                )
+            return documents
+            
+        except Exception as e:
+            st.error(f"Error retrieving documents: {str(e)}")
+            return []
+    
+    async def aget_relevant_documents(self, query: str) -> list[Document]:
+        """Async version of get_relevant_documents"""
+        return self.get_relevant_documents(query)
+
 # Initialize chatbot
 def init_chatbot():
-    # Initialize embedding model
-    embedding = HuggingFaceEmbeddings(
-        model_name="jhgan/ko-sroberta-multitask",
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
-    )
-
-    # Initialize Chroma DB
-    persist_directory = "./chroma_db"
-    vectordb = Chroma(
-        persist_directory=persist_directory,
-        embedding_function=embedding
-    )
-    retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+    # Initialize retriever
+    retriever = SupabaseRetriever(supabase_client, embedding_model, k=3)
 
     # Initialize Ollama
     llm = Ollama(
@@ -62,12 +120,12 @@ def init_chatbot():
         input_variables=["context", "question"]
     )
 
-    # Create QA chain
+    # Create QA chain with custom retriever
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=retriever,
-        chain_type_kwargs={"prompt": prompt}
+        chain_type_kwargs={"prompt": prompt, "document_variable_name": "context"}
     )
     
     return qa_chain
