@@ -1,49 +1,42 @@
-import streamlit as st
-from app.services.chatbot_service import SupabaseChatbot
 import os
+import streamlit as st
 from dotenv import load_dotenv
+from app.services.chatbot_service import SupabaseRAGChatbot
 
-# Load environment variables
 load_dotenv()
 
-st.set_page_config(page_title="보험 챗봇", page_icon="🤖")
+st.set_page_config(page_title="보험 RAG 챗봇", page_icon="💡")
+st.title("🧠 보험 챗봇 (RAG 기반)")
 
-# Initialize chatbot with Supabase
 try:
-    chatbot = SupabaseChatbot()
+    chatbot = SupabaseRAGChatbot()
 except ValueError as e:
-    st.error("Supabase 연결에 실패했습니다. 환경 변수를 확인해주세요.")
+    st.error(str(e))
     st.stop()
 
-# Main page
-st.title("보험 챗봇")
-
-# Chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# 이전 대화 렌더링
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# User input
-if prompt := st.chat_input("질문을 입력하세요"):
-    # Add user message to chat history
+# 사용자 질문 입력
+if prompt := st.chat_input("보험 관련 질문을 입력하세요…"):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    
     with st.chat_message("user"):
         st.markdown(prompt)
-    
+
     with st.chat_message("assistant"):
-        with st.spinner("보험 상품 검색 중..."):
+        with st.spinner("문서 기반 답변 생성 중..."):
             response = chatbot.query(prompt)
-            st.markdown(response, unsafe_allow_html=True)
-    
-    # Add assistant message to chat history
+            st.markdown(response)
+
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Clear chat button
-if st.button("대화 초기화"):
-    st.session_state.messages = []
-    st.rerun()
+# 대화 초기화 버튼
+with st.sidebar:
+    if st.button("💬 대화 초기화"):
+        st.session_state.messages = []
+        st.rerun()
