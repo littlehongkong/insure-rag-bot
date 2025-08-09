@@ -30,7 +30,7 @@ jobs:
       run: python app/services/pdf_to_vectordb.py
 
     - name: Upload ChromaDB as artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: chroma_index
         path: chroma_db/
