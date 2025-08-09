@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 from dotenv import load_dotenv
-from app.services.chatbot_service import SupabaseRAGChatbot
+from app.services.chatbot_service import ChromaRAGChatbot
 
 load_dotenv()
 
@@ -9,7 +9,7 @@ st.set_page_config(page_title="보험 RAG 챗봇", page_icon="💡")
 st.title("🧠 보험 챗봇 (RAG 기반)")
 
 try:
-    chatbot = SupabaseRAGChatbot()
+    chatbot = ChromaRAGChatbot()
 except ValueError as e:
     st.error(str(e))
     st.stop()
@@ -30,7 +30,7 @@ if prompt := st.chat_input("보험 관련 질문을 입력하세요…"):
 
     with st.chat_message("assistant"):
         with st.spinner("문서 기반 답변 생성 중..."):
-            response = chatbot.query(prompt)
+            response = chatbot.ask_direct(prompt)
             st.markdown(response)
 
     st.session_state.messages.append({"role": "assistant", "content": response})
