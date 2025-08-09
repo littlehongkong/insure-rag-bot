@@ -1,0 +1,36 @@
+name: Process PDFs and Upload ChromaDB
+
+on:
+  workflow_dispatch:
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Set up environment variables
+      run: |
+        echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> .env
+        echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> .env
+
+    - name: Run main script
+      run: python app/services/pdf_to_vectordb.py
+
+    - name: Upload ChromaDB as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: chroma_index
+        path: chroma_db/
