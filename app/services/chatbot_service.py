@@ -95,7 +95,11 @@ class ChromaRAGChatbot:
 
 질문: {question}
 
-답변 (핵심 내용만 간결하게):"""
+답변 (핵심 내용만 간결하게):
+- 반드시 문서에 명시된 정보만 근거로 답변하세요.
+- 문서에 해당 보험 상품 정보가 없으면 "문서에 없음"이라고 분명히 말하세요.
+- 비슷한 다른 상품 정보를 추론하여 대신하지 마세요.
+"""
 
         prompt = PromptTemplate(
             template=prompt_template,
