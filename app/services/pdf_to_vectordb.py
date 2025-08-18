@@ -163,12 +163,16 @@ class PDFToVectorDB:
     # =========================
     # 텍스트 / 표 추출
     # =========================
-    def _build_metadata(self, base_meta: Dict[str, Any], pdf_path: str, page_num: int, is_table: bool) -> Dict[str, Any]:
+    def _build_metadata(self, base_meta: Dict[str, Any], pdf_path: str, page_num: int, is_table: bool) -> Dict[
+        str, Any]:
+        """메타데이터 생성 - 페이지 번호는 0-based에서 1-based로 변환"""
         md = {
-            # 파일/페이지
+            # 파일/페이지 (사용자 친화적으로 1-based 페이지 번호)
             "source": str(pdf_path),
-            "page": page_num,
+            "page": page_num,  # 내부적으로는 0-based 유지
+            "page_display": page_num + 1,  # 사용자에게 보여줄 때는 1-based
             "is_table": is_table,
+
             # DB 기본 메타
             "insurer_code": base_meta.get("insurer_code"),
             "insurer_name": base_meta.get("insurer_name"),
@@ -179,6 +183,7 @@ class PDFToVectorDB:
             "file_name": base_meta.get("file_name"),
             "file_url": base_meta.get("file_url"),
             "status": base_meta.get("status"),
+
             # details 확장
             "sell_open_date": (base_meta.get("details") or {}).get("sell_open_date"),
             "sell_end_date": (base_meta.get("details") or {}).get("sell_end_date"),
@@ -191,6 +196,7 @@ class PDFToVectorDB:
             "item_section": (base_meta.get("details") or {}).get("item_section"),
             "crawled_at": (base_meta.get("details") or {}).get("crawled_at"),
             "api_version": (base_meta.get("details") or {}).get("api_version"),
+
             # 인덱싱 시점
             "indexed_at": datetime.now(timezone.utc).isoformat()
         }
@@ -198,86 +204,62 @@ class PDFToVectorDB:
 
     def extract_documents(self, pdf_path: str, db_row: Dict[str, Any]) -> List[Document]:
         import fitz  # PyMuPDF
+        import pdfplumber
+
         docs: List[Document] = []
 
-        def extract_pdf_text(file_path, min_char_threshold=1000):
-            """
-            PDF에서 텍스트를 추출 (1차: pdfplumber, 2차: PyMuPDF 백업)
-            - min_char_threshold: 추출 결과 검증 시 최소 글자 수 기준
-            """
-            import pdfplumber
-
-            text_plumber = ""
-            text_fitz = ""
-
-            # 1차 시도: pdfplumber
-            try:
-                with pdfplumber.open(file_path) as pdf:
-                    for page in pdf.pages:
-                        page_text = page.extract_text() or ""
-                        text_plumber += page_text + "\n"
-            except Exception as e:
-                print(f"[WARN] pdfplumber 오류 발생: {e}")
-
-            # 글자 수 기준으로 파싱 실패 판단
-            if len(text_plumber.strip()) < min_char_threshold:
-                print("[INFO] pdfplumber 결과가 너무 짧음 → PyMuPDF로 재시도")
-                text_plumber = ""  # 무의미하면 버림
-
-            # 2차 시도: PyMuPDF
-            try:
-                doc = fitz.open(file_path)
-                for page in doc:
-                    page_text = page.get_text("text") or ""
-                    text_fitz += page_text + "\n"
-            except Exception as e:
-                print(f"[ERROR] PyMuPDF도 실패: {e}")
-                raise RuntimeError("PDF 파싱 실패 - 두 방식 모두 실패")
-
-            # 누락 방지: 두 결과 병합
-            if text_plumber and text_fitz:
-                if len(text_fitz) > len(text_plumber):
-                    merged = text_fitz
-                    for line in text_plumber.splitlines():
-                        if line not in merged:
-                            merged += "\n" + line
-                    final_text = merged
-                else:
-                    merged = text_plumber
-                    for line in text_fitz.splitlines():
-                        if line not in merged:
-                            merged += "\n" + line
-                    final_text = merged
-            else:
-                final_text = text_plumber or text_fitz
-
-            return final_text.strip()
-
-        # PDF 페이지별 처리
-        text = extract_pdf_text(pdf_path)
-
-        # 최소 단위로 쪼개서 Document 생성 (여기선 페이지 단위 시뮬레이션)
-        # 페이지 구분을 위해 "\f"(form feed)로 split
-        pages = text.split("\f") if "\f" in text else text.splitlines()
-
-        for page_num, page_text in enumerate(pages):
-            if page_text.strip():
-                md = self._build_metadata(db_row, pdf_path, page_num, is_table=False)
-                docs.append(Document(page_content=self._clean_text(page_text), metadata=md))
-
-        # 기존 코드처럼 표 데이터 처리 (pdfplumber 표만 활용)
+        # PyMuPDF로 페이지별 텍스트 추출 (정확한 페이지 매핑)
         try:
-            import pdfplumber
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_num, page in enumerate(pdf.pages):
+            fitz_doc = fitz.open(pdf_path)
+
+            for page_num, page in enumerate(fitz_doc):
+                page_text = page.get_text("text").strip()
+
+                if page_text:
+                    md = self._build_metadata(db_row, pdf_path, page_num, is_table=False)
+                    docs.append(Document(
+                        page_content=self._clean_text(page_text),
+                        metadata=md
+                    ))
+
+            fitz_doc.close()
+            print(f"[추출] PyMuPDF로 {len(docs)}개 페이지 처리")
+
+        except Exception as e:
+            print(f"[ERROR] PyMuPDF 텍스트 추출 실패: {e}")
+            return []
+
+        # 테이블 데이터는 별도로 pdfplumber로 추출 (페이지별 정확 매핑)
+        try:
+            with pdfplumber.open(pdf_path) as plumber_pdf:
+                for page_num, page in enumerate(plumber_pdf.pages):
                     tables = page.extract_tables()
-                    for table in tables or []:
-                        if not table:
+
+                    for table_idx, table in enumerate(tables or []):
+                        if not table or not any(any(cell for cell in row if cell) for row in table):
                             continue
-                        table_text = "\n".join([" | ".join([c if c else "" for c in row]) for row in table])
-                        table_text = "[TABLE DATA]\n" + table_text
-                        md = self._build_metadata(db_row, pdf_path, page_num, is_table=True)
-                        docs.append(Document(page_content=self._clean_text(table_text), metadata=md))
+
+                        # 테이블을 텍스트로 변환
+                        table_rows = []
+                        for row in table:
+                            cleaned_row = [str(cell).strip() if cell else "" for cell in row]
+                            if any(cleaned_row):  # 빈 행 제외
+                                table_rows.append(" | ".join(cleaned_row))
+
+                        if table_rows:
+                            table_text = f"[TABLE {table_idx + 1}]\n" + "\n".join(table_rows)
+                            md = self._build_metadata(db_row, pdf_path, page_num, is_table=True)
+                            # 테이블 메타데이터에 테이블 번호 추가
+                            md["table_index"] = table_idx
+
+                            docs.append(Document(
+                                page_content=self._clean_text(table_text),
+                                metadata=md
+                            ))
+
+            table_count = sum(1 for doc in docs if doc.metadata.get("is_table"))
+            print(f"[추출] pdfplumber로 {table_count}개 테이블 처리")
+
         except Exception as e:
             print(f"[WARN] 테이블 추출 실패: {pdf_path} → {e}")
 
@@ -391,12 +373,211 @@ class PDFToVectorDB:
             except Exception as e:
                 print(f"[예외] 처리 중 오류: {e}")
 
+    def search_with_context(self, query: str, k: int = 5,
+                            context_window: int = 1) -> List[Dict[str, Any]]:
+        """
+        컨텍스트 윈도우를 포함한 검색
+        - 검색된 청크의 앞뒤 청크도 함께 반환하여 문맥 이해 향상
+        """
+        base_results = self.search(query, k=k)
+
+        if not base_results.get("documents") or not base_results["documents"][0]:
+            return []
+
+        enriched_results = []
+
+        for doc, meta, distance in zip(
+                base_results["documents"][0],
+                base_results["metadatas"][0],
+                base_results.get("distances", [[]])[0]
+        ):
+            # 기본 결과
+            result_item = {
+                "content": doc,
+                "metadata": meta,
+                "similarity": 1 - distance,
+                "context_chunks": []
+            }
+
+            # 같은 페이지의 앞뒤 청크 검색
+            try:
+                context_results = self.collection.query(
+                    query_embeddings=[],  # 임베딩 검색 없이
+                    n_results=50,  # 충분한 수
+                    where={
+                        "insurer_code": meta.get("insurer_code"),
+                        "item_code": meta.get("item_code"),
+                        "page": meta.get("page")
+                    }
+                )
+
+                # 블록 인덱스 기준으로 정렬 후 컨텍스트 추출
+                if context_results.get("metadatas"):
+                    current_block = meta.get("block_index", 0)
+                    context_candidates = []
+
+                    for ctx_doc, ctx_meta in zip(
+                            context_results["documents"][0],
+                            context_results["metadatas"][0]
+                    ):
+                        ctx_block = ctx_meta.get("block_index", 999)
+                        if abs(ctx_block - current_block) <= context_window:
+                            context_candidates.append({
+                                "content": ctx_doc,
+                                "metadata": ctx_meta,
+                                "block_distance": abs(ctx_block - current_block)
+                            })
+
+                    # 블록 거리순 정렬
+                    context_candidates.sort(key=lambda x: x["block_distance"])
+                    result_item["context_chunks"] = context_candidates[:context_window * 2 + 1]
+
+            except Exception as e:
+                print(f"[WARN] 컨텍스트 검색 실패: {e}")
+
+            enriched_results.append(result_item)
+
+        return enriched_results
+
+    def test_queries(self):
+        """
+        자동화된 검색 품질 테스트
+        """
+        test_cases = {
+            # 일반적인 보험 관련 질문들
+            "입원시 식대는 보장되나요?": ["식대", "입원", "보장"],
+            "사망시 누가 보험금을 받나요?": ["사망", "보험금", "수익자"],
+            "갱신 시 보험료가 오르나요?": ["갱신", "보험료", "인상"],
+            "면책기간은 언제까지인가요?": ["면책", "기간"],
+            "해약환급금은 어떻게 계산하나요?": ["해약", "환급금", "계산"],
+            "보험료 납입이 연체되면 어떻게 되나요?": ["보험료", "연체", "납입"],
+        }
+
+        print("🧪 검색 품질 자동화 테스트")
+        print("=" * 60)
+
+        total_tests = len(test_cases)
+        passed_tests = 0
+
+        for query, expected_keywords in test_cases.items():
+            print(f"\n❓ 질문: {query}")
+
+            # 검색 실행
+            results = self.search(query, k=3, debug=True)
+
+            if not results.get("documents") or not results["documents"][0]:
+                print("❌ 검색 결과 없음")
+                continue
+
+            # 상위 결과 평가
+            top_result = results["documents"][0][0]
+            top_meta = results["metadatas"][0][0]
+
+            # 키워드 매칭 검사
+            matched_keywords = []
+            for keyword in expected_keywords:
+                if keyword in top_result:
+                    matched_keywords.append(keyword)
+
+            # 결과 평가
+            success_rate = len(matched_keywords) / len(expected_keywords)
+            is_pass = success_rate >= 0.5  # 50% 이상 키워드 매칭시 통과
+
+            if is_pass:
+                passed_tests += 1
+                print(f"✅ PASS (키워드 매칭: {len(matched_keywords)}/{len(expected_keywords)})")
+            else:
+                print(f"❌ FAIL (키워드 매칭: {len(matched_keywords)}/{len(expected_keywords)})")
+
+            print(f"📄 출처: {top_meta.get('item_name')} p.{top_meta.get('page_display')}")
+            print(f"💡 내용 미리보기: {top_result[:100]}...")
+
+            if matched_keywords:
+                print(f"🎯 매칭된 키워드: {', '.join(matched_keywords)}")
+
+        # 전체 결과
+        print("\n" + "=" * 60)
+        print(f"🏆 전체 테스트 결과: {passed_tests}/{total_tests} ({passed_tests / total_tests * 100:.1f}%)")
+
+        if passed_tests / total_tests >= 0.7:
+            print("🎉 검색 품질 양호!")
+        else:
+            print("⚠️  검색 품질 개선 필요")
+
+        return passed_tests / total_tests
+
     # =========================
     # 검색 유틸 (테스트용)
     # =========================
-    def search(self, query: str, k: int = 3):
-        q_emb = self.create_embeddings([query])[0]
-        return self.collection.query(query_embeddings=[q_emb], n_results=k)
+    def search(self, query: str, k: int = 3,
+               insurer_code: Optional[str] = None,
+               item_code: Optional[str] = None,
+               include_tables: bool = True,
+               debug: bool = False) -> Dict[str, Any]:
+        """
+        향상된 검색 기능
+
+        Args:
+            query: 검색 쿼리
+            k: 반환할 결과 수
+            insurer_code: 보험사 코드 필터
+            item_code: 상품 코드 필터
+            include_tables: 테이블 데이터 포함 여부
+            debug: 디버그 정보 출력 여부
+        """
+        # 쿼리 정규화
+        normalized_query = self._normalize_text(query)
+        q_emb = self.create_embeddings([normalized_query])[0]
+
+        # where 조건 구성
+        where_conditions = {}
+        if insurer_code:
+            where_conditions["insurer_code"] = insurer_code
+        if item_code:
+            where_conditions["item_code"] = item_code
+        if not include_tables:
+            where_conditions["is_table"] = False
+
+        # 검색 실행
+        try:
+            if where_conditions:
+                result = self.collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=k,
+                    where=where_conditions
+                )
+            else:
+                result = self.collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=k
+                )
+
+            # 디버그 정보 출력
+            if debug:
+                print(f"\n🔍 검색 쿼리: '{query}'")
+                print(f"📊 정규화된 쿼리: '{normalized_query}'")
+                print(f"🎯 필터 조건: {where_conditions}")
+                print(f"📈 검색 결과 수: {len(result.get('documents', [[]])[0])}")
+                print("=" * 50)
+
+                for i, (doc, meta, distance) in enumerate(zip(
+                        result.get("documents", [[]])[0],
+                        result.get("metadatas", [[]])[0],
+                        result.get("distances", [[]])[0]
+                )):
+                    print(f"\n[{i + 1}] 유사도: {1 - distance:.3f}")
+                    print(f"📄 {meta.get('item_name')} ({meta.get('item_code')})")
+                    print(
+                        f"📄 페이지: {meta.get('page_display', meta.get('page', 0))} {'[테이블]' if meta.get('is_table') else '[텍스트]'}")
+                    print(f"📄 파일: {meta.get('file_name')}")
+                    print(f"💡 내용: {doc[:200]}{'...' if len(doc) > 200 else ''}")
+                    print("-" * 30)
+
+            return result
+
+        except Exception as e:
+            print(f"[ERROR] 검색 실패: {e}")
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
 
 
 def main():
