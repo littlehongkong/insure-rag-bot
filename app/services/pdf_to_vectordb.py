@@ -1,307 +1,420 @@
 import os
 import re
-import uuid
+import hashlib
 import requests
 from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from transformers import AutoTokenizer
-from PyPDF2.errors import PdfReadError
-
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, Optional, List
 import PyPDF2
 import chromadb
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import supabase
+from transformers import AutoTokenizer
+import supabase  # pip install supabase
 
+# =========================
 # 환경 변수 로드
+# =========================
 load_dotenv()
 
+
 class PDFToVectorDB:
-    def __init__(self, use_openai=False, openai_api_key=None):
+    """
+    보험 약관 PDF -> 텍스트/표 추출 -> 청크/임베딩 -> ChromaDB 저장 파이프라인
+    - Supabase의 insurance_products 테이블을 기준으로 오늘(updated_at) 변경된 약관만 처리
+    - 처리 전 같은 (insurer_code, item_code) 기존 벡터는 전량 삭제하여 최신 약관만 유지
+    """
+
+    def __init__(self, insurer_code: str = "LINA", collection_name: str = "insurance_pdfs", use_openai: bool = False, openai_api_key: Optional[str] = None):
+        self.insurer_code = insurer_code
+        self.collection_name = collection_name
+
         self.use_openai = use_openai
+        self.openai_api_key = openai_api_key
+        self.embeddings = None  # (옵션) OpenAI 쓸 때 할당
 
-        self.embedding_model = SentenceTransformer('BM-K/KoSimCSE-roberta-multitask')
-        self.embeddings = None
-        tokenizer = AutoTokenizer.from_pretrained('BM-K/KoSimCSE-roberta-multitask')
+        # 한국어 임베딩 모델 (384차원)
+        self.embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+        self.tokenizer = AutoTokenizer.from_pretrained('jhgan/ko-sroberta-multitask')
 
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=400,
+        # 길이 기반 텍스트 분할기 (토크나이저 기준)
+        self.length_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
             chunk_overlap=50,
-            length_function=lambda text: len(tokenizer.encode(text, add_special_tokens=False)),
+            length_function=lambda text: len(self.tokenizer.encode(text, add_special_tokens=False)),
+            separators=["\n\n", "\n", " ", ""]
         )
 
-        # 저장 경로 설정
+        # 저장 경로
         base_path = Path(__file__).resolve().parent.parent.parent
-        self.pdf_dir = base_path / 'pdfs'
+        self.base_pdf_dir = base_path / 'pdfs'
+        self.base_pdf_dir.mkdir(parents=True, exist_ok=True)
+        self.pdf_dir = self.base_pdf_dir / self.insurer_code
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
 
-        # ChromaDB 클라이언트
+        # ChromaDB (영구형)
         db_path = base_path / 'chroma_db'
         db_path.mkdir(parents=True, exist_ok=True)
         self.chroma_client = chromadb.PersistentClient(path=str(db_path))
+        try:
+            self.collection = self.chroma_client.get_collection(self.collection_name)
+        except Exception:
+            self.collection = self.chroma_client.create_collection(name=self.collection_name)
 
-        # Supabase 클라이언트 초기화
+        # Supabase
         self.supabase_url = os.getenv('SUPABASE_URL')
         self.supabase_key = os.getenv('SUPABASE_KEY')
         self.supabase = supabase.create_client(self.supabase_url, self.supabase_key)
 
-    def search_similar(self, query: str, collection_name: str = "insurance_pdfs", k: int = 3):
-        collection = self.chroma_client.get_collection(collection_name)
-        query_embedding = self.create_embeddings([query])[0]
-        results = collection.query(query_embeddings=[query_embedding], n_results=k)
-        return results
+    # =========================
+    # 유틸
+    # =========================
+    def _start_of_today_kst_iso(self) -> str:
+        """KST(UTC+9) 오늘 00:00:00을 ISO8601로 반환"""
+        kst = timezone(timedelta(hours=9))
+        now_kst = datetime.now(kst)
+        start = datetime(year=now_kst.year, month=now_kst.month, day=now_kst.day, tzinfo=kst)
+        return start.isoformat()
 
-    def download_pdf(self, summary_seq: int, product_info: Dict[str, Any]) -> Optional[str]:
-        try:
-            url = f"https://kpub.knia.or.kr/file/download/{summary_seq}.do"
-            response = requests.get(url, stream=True, verify=False)
-            response.raise_for_status()
+    def _deterministic_id(self, insurer_code: str, item_code: str, file_name: str, page: int, chunk_idx: int) -> str:
+        raw = f"{insurer_code}|{item_code}|{file_name}|{page}|{chunk_idx}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{product_info.get('TP_CODE', '')}_{product_info.get('P_CODE', '')}_{timestamp}.pdf"
-            filepath = self.pdf_dir / filename
-
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            # === PDF 유효성 검사 ===
-            with open(filepath, 'rb') as f:
-                try:
-                    reader = PyPDF2.PdfReader(f)
-                    _ = len(reader.pages)  # 페이지 접근 시 오류 발생하면 invalid
-                except Exception as e:
-                    print(f"[오류] 유효하지 않은 PDF 파일입니다. 삭제합니다. ({filepath}): {e}")
-                    filepath.unlink(missing_ok=True)
-                    return None
-
-            return str(filepath)
-
-        except Exception as e:
-            print(f"PDF 다운로드 실패 (SUMMARY_SEQ: {summary_seq}): {str(e)}")
-            return None
-    def clean_text(self, text: str) -> str:
+    def _clean_text(self, text: str) -> str:
         return re.sub(r'[\x00\u0000]', '', text)
 
-    def extract_text_from_pdf(self, pdf_path, product_info=None):
-        documents = []
-        with open(pdf_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            for page_num, page in enumerate(pdf_reader.pages):
-                text = page.extract_text()
-                metadata = {
-                    "source": pdf_path,
-                    "page": page_num
-                }
-
-                if product_info:
-                    metadata.update({
-                        'id': str(product_info.get('id', '')),
-                        'tp_name': product_info.get('TP_NAME', ''),
-                        'tp_code': product_info.get('TP_CODE', ''),
-                        'p_code_nm': product_info.get('P_CODE_NM', '')
-                    })
-
-                doc = Document(
-                    page_content=text,
-                    metadata=metadata
-                )
-                documents.append(doc)
-        return documents
-
-    def create_embeddings(self, texts):
-        if self.use_openai:
-            return [self.embeddings.embed_query(text) for text in texts]
-        else:
-            embeddings = self.embedding_model.encode(texts, normalize_embeddings=True)
-            return embeddings
-
-    def save_to_chroma_manual(self, documents, collection_name="pdf_collection"):
-        if not documents:
-            print("저장할 문서가 없습니다.")
-            return False
-
-        texts = self.text_splitter.split_documents(documents)
-        print(f"총 {len(texts)}개의 청크로 분할되었습니다.")
-
-        text_contents = [doc.page_content for doc in texts]
-        metadatas = [doc.metadata for doc in texts]
-        ids = [f"doc_{uuid.uuid4()}" for _ in range(len(texts))]
-
-        print("임베딩 생성 중...")
-        embeddings = self.create_embeddings(text_contents)
-
-        try:
-            try:
-                collection = self.chroma_client.get_collection(collection_name)
-                print(f"기존 컬렉션 '{collection_name}'에 저장 중...")
-            except:
-                collection = self.chroma_client.create_collection(name=collection_name)
-                print(f"새 컬렉션 '{collection_name}'을 생성하고 저장 중...")
-
-            batch_size = 50
-            for i in range(0, len(texts), batch_size):
-                collection.upsert(
-                    documents=text_contents[i:i + batch_size],
-                    embeddings=embeddings[i:i + batch_size],
-                    metadatas=metadatas[i:i + batch_size],
-                    ids=ids[i:i + batch_size]
-                )
-                print(f"{min(i + batch_size, len(texts))}/{len(texts)} 문서 저장 완료")
-
-            print(f"\n총 {len(texts)}개의 문서가 ChromaDB에 저장되었습니다.")
-            return True
-
-        except Exception as e:
-            print(f"Chroma 저장 중 오류 발생: {str(e)}")
-            return False
-
-    def process_insurance_products(self, collection_name="insurance_pdfs") -> None:
-        """Supabase에서 보험 상품 조회 후 PDF 다운로드, 텍스트 추출, 벡터 DB 저장"""
-        try:
-            # Supabase에서 모든 보험 상품 데이터 조회
-            response = self.supabase.table('insurance_products_raw').select('*').execute()
-            products = response.data if hasattr(response, 'data') else []
-            print(f"처리할 보험 상품 개수: {len(products)}")
-            if not products:
-                print("처리할 보험 상품이 없습니다.")
-                return
-
-            for index, product in enumerate(products):
-                print(f"처리 중: {index + 1}/{len(products)}")
-
-                summary_seq = product.get('SUMMARY_SEQ')
-                if not summary_seq:
-                    print(f"SUMMARY_SEQ가 없는 상품 건너뜁니다: {product.get('id', '')}")
-                    continue
-
-                print(f"처리 중: {product.get('TP_NAME')} - {product.get('P_CODE_NM')}")
-
-                # PDF 다운로드
-                pdf_path = self.download_pdf(summary_seq, product)
-                if not pdf_path:
-                    print(f"PDF 다운로드 실패: SUMMARY_SEQ={summary_seq}")
-                    continue
-
-                # PDF에서 텍스트 추출
-                documents = self.extract_text_from_pdf(pdf_path, product_info=product)
-                if not documents:
-                    print(f"텍스트 추출 실패: {pdf_path}")
-                    continue
-
-                # ChromaDB에 저장
-                success = self.save_to_chroma_manual(documents, collection_name)
-                if success:
-                    print(f"처리 완료: {pdf_path}")
-                else:
-                    print(f"저장 실패: {pdf_path}")
-
-        except Exception as e:
-            print(f"보험 상품 처리 중 오류 발생: {str(e)}")
-
-    def process_pdf(self, pdf_path, collection_name="pdf_collection"):
-        print(f"PDF 처리 시작: {pdf_path}")
-        documents = self.extract_text_from_pdf(pdf_path)
-        print(f"추출된 페이지 수: {len(documents)}")
-
-        success = self.save_to_chroma_manual(documents, collection_name=collection_name)
-        if success:
-            print("PDF 처리 완료!")
-        return success
-
-
-
-def process_pdf_directory(pdf_dir: str, processor: PDFToVectorDB, collection_name: str = "insurance_pdfs") -> None:
-    """디렉토리 내 모든 PDF 파일을 처리하여 벡터 DB에 저장"""
-    pdf_dir = Path(pdf_dir)
-    if not pdf_dir.exists() or not pdf_dir.is_dir():
-        print(f"오류: '{pdf_dir}' 디렉토리를 찾을 수 없습니다.")
-        return
-
-    pdf_files = list(pdf_dir.glob("*.pdf"))
-    if not pdf_files:
-        print(f"'{pdf_dir}' 디렉토리에 PDF 파일이 없습니다.")
-        return
-
-    print(f"\n총 {len(pdf_files)}개의 PDF 파일을 처리합니다.\n")
-
-    for pdf_file in pdf_files:
-        try:
-            print(f"\n[처리 중] {pdf_file.name}")
-            documents = processor.extract_text_from_pdf(str(pdf_file))
-            if not documents:
-                print(f"경고: '{pdf_file}'에서 텍스트를 추출할 수 없습니다. 건너뜁니다.")
+    def _regex_chunk_split(self, text: str) -> List[str]:
+        """
+        표/리스트를 하나의 chunk로 묶기 위한 regex 분리 (원 코드 개선/재사용)
+        """
+        pattern = r"(\n\s*(?:[-•*]|\d+\.)\s.*|\n.*\t.*)"
+        parts = re.split(pattern, text)
+        chunks = []
+        buffer = ""
+        for part in parts:
+            if not part:
                 continue
-
-            success = processor.save_to_chroma_manual(documents, collection_name=collection_name)
-            if success:
-                print(f"[완료] {pdf_file.name} 처리 완료")
+            if re.match(pattern, part):
+                buffer += part
             else:
-                print(f"[실패] {pdf_file.name} 처리 중 오류 발생")
+                if buffer:
+                    chunks.append(buffer.strip())
+                    buffer = ""
+                chunks.append(part.strip())
+        if buffer:
+            chunks.append(buffer.strip())
+        return [c for c in chunks if c]
 
+    # =========================
+    # Supabase 조회
+    # =========================
+    def fetch_products_updated_today(self) -> List[Dict[str, Any]]:
+        """
+        오늘(KST) 업데이트된 보험 상품(약관)만 조회
+        스키마: insurance_products
+        """
+        start_kst = self._start_of_today_kst_iso()
+        res = self.supabase.table('insurance_products') \
+            .select('*') \
+            .eq('insurer_code', self.insurer_code) \
+            .order('updated_at', desc=False) \
+            .execute()
+
+        # .gte('updated_at', start_kst) \
+        return res.data if hasattr(res, 'data') else []
+
+    # =========================
+    # PDF 다운로드
+    # =========================
+    def download_pdf_from_dbrow(self, row: Dict[str, Any]) -> Optional[str]:
+        """
+        DB 레코드의 file_url / file_name 기준으로 PDF 다운로드
+        """
+        file_url = row.get('file_url')
+        file_name = row.get('file_name') or f"{row.get('item_code', 'unknown')}.pdf"
+        if not file_url:
+            print(f"[경고] file_url 이 없어 다운로드 건너뜀: item_code={row.get('item_code')}")
+            return None
+
+        local_path = self.pdf_dir / file_name
+        try:
+            resp = requests.get(file_url, stream=True, timeout=30)
+            resp.raise_for_status()
+            with open(local_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            # 유효성
+            with open(local_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                _ = len(reader.pages)
+            print(f"[다운로드 완료] {local_path}")
+            return str(local_path)
         except Exception as e:
-            print(f"오류: {pdf_file} 처리 중 예외 발생 - {str(e)}")
-            continue
+            print(f"[오류] PDF 다운로드 실패: {file_url} ({e})")
+            if local_path.exists():
+                try:
+                    local_path.unlink()
+                except Exception:
+                    pass
+            return None
+
+    # =========================
+    # 텍스트 / 표 추출
+    # =========================
+    def _build_metadata(self, base_meta: Dict[str, Any], pdf_path: str, page_num: int, is_table: bool) -> Dict[str, Any]:
+        md = {
+            # 파일/페이지
+            "source": str(pdf_path),
+            "page": page_num,
+            "is_table": is_table,
+            # DB 기본 메타
+            "insurer_code": base_meta.get("insurer_code"),
+            "insurer_name": base_meta.get("insurer_name"),
+            "item_type": base_meta.get("item_type"),
+            "category_name": base_meta.get("category_name"),
+            "item_name": base_meta.get("item_name"),
+            "item_code": base_meta.get("item_code"),
+            "file_name": base_meta.get("file_name"),
+            "file_url": base_meta.get("file_url"),
+            "status": base_meta.get("status"),
+            # details 확장
+            "sell_open_date": (base_meta.get("details") or {}).get("sell_open_date"),
+            "sell_end_date": (base_meta.get("details") or {}).get("sell_end_date"),
+            "klia_product_code": (base_meta.get("details") or {}).get("klia_product_code"),
+            "kcis_insurance_code": (base_meta.get("details") or {}).get("kcis_insurance_code"),
+            "prod_pban_grp_cd": (base_meta.get("details") or {}).get("prod_pban_grp_cd"),
+            "product_summary": (base_meta.get("details") or {}).get("product_summary"),
+            "product_method": (base_meta.get("details") or {}).get("product_method"),
+            "item_sequence": (base_meta.get("details") or {}).get("item_sequence"),
+            "item_section": (base_meta.get("details") or {}).get("item_section"),
+            "crawled_at": (base_meta.get("details") or {}).get("crawled_at"),
+            "api_version": (base_meta.get("details") or {}).get("api_version"),
+            # 인덱싱 시점
+            "indexed_at": datetime.now(timezone.utc).isoformat()
+        }
+        return md
+
+    def extract_documents(self, pdf_path: str, db_row: Dict[str, Any]) -> List[Document]:
+        import fitz  # PyMuPDF
+        docs: List[Document] = []
+
+        def extract_pdf_text(file_path, min_char_threshold=1000):
+            """
+            PDF에서 텍스트를 추출 (1차: pdfplumber, 2차: PyMuPDF 백업)
+            - min_char_threshold: 추출 결과 검증 시 최소 글자 수 기준
+            """
+            import pdfplumber
+
+            text_plumber = ""
+            text_fitz = ""
+
+            # 1차 시도: pdfplumber
+            try:
+                with pdfplumber.open(file_path) as pdf:
+                    for page in pdf.pages:
+                        page_text = page.extract_text() or ""
+                        text_plumber += page_text + "\n"
+            except Exception as e:
+                print(f"[WARN] pdfplumber 오류 발생: {e}")
+
+            # 글자 수 기준으로 파싱 실패 판단
+            if len(text_plumber.strip()) < min_char_threshold:
+                print("[INFO] pdfplumber 결과가 너무 짧음 → PyMuPDF로 재시도")
+                text_plumber = ""  # 무의미하면 버림
+
+            # 2차 시도: PyMuPDF
+            try:
+                doc = fitz.open(file_path)
+                for page in doc:
+                    page_text = page.get_text("text") or ""
+                    text_fitz += page_text + "\n"
+            except Exception as e:
+                print(f"[ERROR] PyMuPDF도 실패: {e}")
+                raise RuntimeError("PDF 파싱 실패 - 두 방식 모두 실패")
+
+            # 누락 방지: 두 결과 병합
+            if text_plumber and text_fitz:
+                if len(text_fitz) > len(text_plumber):
+                    merged = text_fitz
+                    for line in text_plumber.splitlines():
+                        if line not in merged:
+                            merged += "\n" + line
+                    final_text = merged
+                else:
+                    merged = text_plumber
+                    for line in text_fitz.splitlines():
+                        if line not in merged:
+                            merged += "\n" + line
+                    final_text = merged
+            else:
+                final_text = text_plumber or text_fitz
+
+            return final_text.strip()
+
+        # PDF 페이지별 처리
+        text = extract_pdf_text(pdf_path)
+
+        # 최소 단위로 쪼개서 Document 생성 (여기선 페이지 단위 시뮬레이션)
+        # 페이지 구분을 위해 "\f"(form feed)로 split
+        pages = text.split("\f") if "\f" in text else text.splitlines()
+
+        for page_num, page_text in enumerate(pages):
+            if page_text.strip():
+                md = self._build_metadata(db_row, pdf_path, page_num, is_table=False)
+                docs.append(Document(page_content=self._clean_text(page_text), metadata=md))
+
+        # 기존 코드처럼 표 데이터 처리 (pdfplumber 표만 활용)
+        try:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    tables = page.extract_tables()
+                    for table in tables or []:
+                        if not table:
+                            continue
+                        table_text = "\n".join([" | ".join([c if c else "" for c in row]) for row in table])
+                        table_text = "[TABLE DATA]\n" + table_text
+                        md = self._build_metadata(db_row, pdf_path, page_num, is_table=True)
+                        docs.append(Document(page_content=self._clean_text(table_text), metadata=md))
+        except Exception as e:
+            print(f"[WARN] 테이블 추출 실패: {pdf_path} → {e}")
+
+        return docs
+
+
+    # =========================
+    # 임베딩
+    # =========================
+    def create_embeddings(self, texts: List[str]):
+        if self.use_openai:
+            # 필요 시 OpenAI 임베딩으로 교체 (현재는 sentence_transformers 사용)
+            return [self.embeddings.embed_query(t) for t in texts]
+        return self.embedding_model.encode(texts, normalize_embeddings=True)
+
+    # =========================
+    # 저장(Chroma) — 기존 벡터 삭제 후 업서트
+    # =========================
+    def upsert_documents(self, docs: List[Document], insurer_code: str, item_code: str, file_name: str):
+        if not docs:
+            print("[경고] 저장할 문서가 없습니다.")
+            return False
+
+        # 1) 이전 데이터 삭제: 같은 (insurer_code, item_code) 전량 제거 → 개정 전 벡터 제거
+        try:
+            self.collection.delete(where={"insurer_code": insurer_code, "item_code": item_code})
+            print(f"[정리] 기존 벡터 삭제 완료: insurer_code={insurer_code}, item_code={item_code}")
+        except Exception as e:
+            print(f"[경고] 기존 벡터 삭제 중 오류 (무시하고 진행): {e}")
+
+        # 2) 청크화
+        chunks: List[Document] = []
+        for d in docs:
+            # 표/리스트를 우선 블록 기준으로 분할
+            blocks = self._regex_chunk_split(d.page_content)
+            for block in blocks:
+                # 길이 기반 세분화
+                sub_texts = self.length_splitter.split_text(block)
+                for sub in sub_texts:
+                    chunks.append(Document(page_content=sub, metadata=d.metadata))
+
+        print(f"[분할] 총 {len(chunks)}개 청크")
+
+        # 3) 임베딩 및 업서트 (결정적 ID)
+        texts = [c.page_content for c in chunks]
+        metas = [c.metadata for c in chunks]
+        embeddings = self.create_embeddings(texts)
+
+        ids = []
+        per_page_counters = {}  # 페이지별 청크 인덱스
+        for m in metas:
+            page = int(m.get("page", 0))
+            key = (page,)
+            per_page_counters[key] = per_page_counters.get(key, 0) + 1
+            chunk_idx = per_page_counters[key] - 1
+            ids.append(self._deterministic_id(insurer_code, item_code, file_name, page, chunk_idx))
+
+        # 배치 업서트
+        BATCH = 64
+        try:
+            for i in range(0, len(chunks), BATCH):
+                self.collection.upsert(
+                    documents=texts[i:i+BATCH],
+                    embeddings=embeddings[i:i+BATCH],
+                    metadatas=metas[i:i+BATCH],
+                    ids=ids[i:i+BATCH]
+                )
+                print(f"[업서트] {min(i+BATCH, len(chunks))}/{len(chunks)}")
+            print(f"[완료] 총 {len(chunks)}개 청크 업서트 완료")
+            return True
+        except Exception as e:
+            print(f"[오류] Chroma 업서트 실패: {e}")
+            return False
+
+    # =========================
+    # 메인 처리 루틴
+    # =========================
+    def index_today_updated_products(self):
+        """
+        오늘 변경된 약관만 색인
+        """
+        rows = self.fetch_products_updated_today()
+        print(f"[조회] 오늘 변경된 약관: {len(rows)}건")
+        if not rows:
+            return
+
+        for idx, row in enumerate(rows, 1):
+            try:
+                print(f"\n[{idx}/{len(rows)}] {row.get('item_name')} ({row.get('item_code')}) - {row.get('file_name')}")
+                pdf_path = self.pdf_dir / row.get('file_name')
+                # pdf_path = self.download_pdf_from_dbrow(row)
+                # if not pdf_path:
+                #     print("[건너뜀] PDF 다운로드 실패")
+                #     continue
+
+                docs = self.extract_documents(pdf_path, db_row=row)
+                if not docs:
+                    print("[건너뜀] 텍스트 추출 실패/없음")
+                    continue
+
+                ok = self.upsert_documents(
+                    docs,
+                    insurer_code=row.get("insurer_code"),
+                    item_code=row.get("item_code"),
+                    file_name=row.get("file_name")
+                )
+                if ok:
+                    print(f"[색인 완료] {row.get('item_code')} / {row.get('file_name')}")
+                else:
+                    print(f"[실패] 색인 실패: {row.get('item_code')} / {row.get('file_name')}")
+            except Exception as e:
+                print(f"[예외] 처리 중 오류: {e}")
+
+    # =========================
+    # 검색 유틸 (테스트용)
+    # =========================
+    def search(self, query: str, k: int = 3):
+        q_emb = self.create_embeddings([query])[0]
+        return self.collection.query(query_embeddings=[q_emb], n_results=k)
 
 
 def main():
-    # 환경 변수에서 OpenAI API 키 로드
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    use_openai = False  # 기본값은 무료 모델 사용
+    processor = PDFToVectorDB(insurer_code="LINA", collection_name="insurance_pdfs", use_openai=False)
+    print("[시작] 오늘 변경분 색인")
+    processor.index_today_updated_products()
+    print("[끝] 색인 완료")
 
-    # PDFToVectorDB 인스턴스 생성
-    print("PDF 처리기 초기화 중...")
-    pdf_processor = PDFToVectorDB(use_openai=use_openai, openai_api_key=openai_api_key)
-
+    # 간단 검색 예시
     try:
-        # 1. 데이터베이스에서 보험 상품 정보를 가져와 PDF 다운로드 및 처리
-        print("\n보험 상품 데이터베이스에서 PDF 다운로드 및 처리 중...")
-        pdf_processor.process_insurance_products(collection_name="insurance_pdfs")
-        print("보험 상품 PDF 처리 완료!")
+        res = processor.search("갱신/비갱신 조건과 면책사항을 알려줘", k=3)
+        if res and res.get("documents"):
+            print("\n=== 검색 결과 ===")
+            for i, (doc, meta) in enumerate(zip(res["documents"][0], res["metadatas"][0]), 1):
+                print(f"{i}. {meta.get('item_name')} ({meta.get('item_code')}) p.{int(meta.get('page',0))+1}  [{meta.get('file_name')}]")
+                print(doc[:200] + ("..." if len(doc) > 200 else ""))
     except Exception as e:
-        print(f"보험 상품 처리 중 오류 발생: {str(e)}")
-        print("PDF 디렉토리에서 파일 처리를 시도합니다...")
-
-    # 2. PDF 디렉토리에서 직접 파일 처리 (백업)
-    # try:
-    #     current_dir = os.path.dirname(os.path.abspath(__file__))
-    #     pdf_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "pdfs")
-    #
-    #     # PDF 디렉토리가 존재하는지 확인
-    #     if os.path.exists(pdf_dir) and os.path.isdir(pdf_dir):
-    #         print(f"\nPDF 디렉토리에서 파일 처리 중: {pdf_dir}")
-    #         process_pdf_directory(pdf_dir, pdf_processor, collection_name="insurance_pdfs")
-    #     else:
-    #         print(f"\nPDF 디렉토리를 찾을 수 없습니다: {pdf_dir}")
-    # except Exception as e:
-    #     print(f"PDF 디렉토리 처리 중 오류 발생: {str(e)}")
-
-    # 검색 예제 실행
-    print("\n검색 예제:")
-    search_example(pdf_processor, "보험 상품에 대한 정보", collection_name="insurance_pdfs")
-
-    print("\n모든 처리가 완료되었습니다.")
-
-
-def search_example(processor, query: str = "보험 상품에 대한 정보", collection_name: str = "insurance_pdfs", k: int = 3):
-    """검색 예제 함수"""
-    print(f"\n'{query}'에 대한 유사 문서 검색 중...")
-    results = processor.search_similar(query, collection_name=collection_name, k=k)
-
-    if results and 'documents' in results and results['documents'] and results['metadatas']:
-        print(f"\n=== 검색 결과 (상위 {k}개) ===")
-        for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0]), 1):
-            source = metadata.get('source', '알 수 없음')
-            print(f"\n{i}. 출처: {os.path.basename(source)}")
-            print(f"   관련 상품: {metadata.get('tp_name', '알 수 없음')} ({metadata.get('tp_code', '')})")
-            print(f"   페이지: {metadata.get('page', 0) + 1} 페이지")
-            print("-" * 80)
-            print(doc[:500] + ("..." if len(doc) > 500 else ""))
-    else:
-        print("검색 결과가 없거나 오류가 발생했습니다.")
+        print(f"[검색 예외] {e}")
 
 
 if __name__ == "__main__":
