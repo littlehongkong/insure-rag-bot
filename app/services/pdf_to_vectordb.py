@@ -1,3 +1,4 @@
+#B00312010_1_P
 import os
 import re
 import hashlib
@@ -315,6 +316,8 @@ class PDFToVectorDB:
             key = (page,)
             per_page_counters[key] = per_page_counters.get(key, 0) + 1
             chunk_idx = per_page_counters[key] - 1
+            # 메타데이터에 chunk_index 추가
+            m['chunk_index'] = chunk_idx
             ids.append(self._deterministic_id(insurer_code, item_code, file_name, page, chunk_idx))
 
         # 배치 업서트
@@ -413,14 +416,14 @@ class PDFToVectorDB:
 
                 # 블록 인덱스 기준으로 정렬 후 컨텍스트 추출
                 if context_results.get("metadatas"):
-                    current_block = meta.get("block_index", 0)
+                    current_block = meta.get("chunk_index", 0)
                     context_candidates = []
 
                     for ctx_doc, ctx_meta in zip(
                             context_results["documents"][0],
                             context_results["metadatas"][0]
                     ):
-                        ctx_block = ctx_meta.get("block_index", 999)
+                        ctx_block = ctx_meta.get("chunk_index", 999)
                         if abs(ctx_block - current_block) <= context_window:
                             context_candidates.append({
                                 "content": ctx_doc,
@@ -505,6 +508,19 @@ class PDFToVectorDB:
             print("⚠️  검색 품질 개선 필요")
 
         return passed_tests / total_tests
+
+    # PDFToVectorDB 클래스 내부에 아래 함수 추가
+    # =========================
+    # 유틸
+    # =========================
+    def _normalize_text(self, text: str) -> str:
+        """
+        텍스트를 정규화하여 검색 정확도를 높입니다.
+        """
+        # 불필요한 공백 제거, 소문자 변환, 특수 문자 제거 등을 포함할 수 있습니다.
+        # 예시: return re.sub(r'[^가-힣a-zA-Z0-9\s]', '', text).lower()
+        return text.strip()
+
 
     # =========================
     # 검색 유틸 (테스트용)
